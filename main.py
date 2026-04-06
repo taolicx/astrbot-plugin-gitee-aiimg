@@ -1694,11 +1694,22 @@ class GiteeAIImagePlugin(Star):
     async def gitee_draw_image(self, event: AstrMessageEvent, prompt: str):
         """（兼容旧版本）根据提示词生成图片。
 
+        兼容策略：
+        - 普通绘图请求仍按文生图处理
+        - 如果提示词本身明显是在要“bot 自拍 / 你自己的自拍”，则强制切到自拍参考链路
+          避免旧工具名被 LLM 选中后，把自拍错误走成文生图
+
         Args:
             prompt(string): 图片提示词，需要包含主体、场景、风格等描述
         """
+        route_mode = "text"
+        if self._is_auto_selfie_prompt(prompt):
+            route_mode = "selfie_ref"
+            logger.info("[gitee_draw_image] route=selfie_ref (compat tool)")
+        else:
+            logger.info("[gitee_draw_image] route=text (compat tool)")
         return await self.aiimg_generate(
-            event, prompt=prompt, mode="text", backend="auto"
+            event, prompt=prompt, mode=route_mode, backend="auto"
         )
 
     @filter.llm_tool(name="gitee_edit_image")
