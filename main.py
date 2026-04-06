@@ -516,6 +516,7 @@ class GiteeAIImagePlugin(Star):
 
         self._concurrency_lock = asyncio.Lock()
         self._image_inflight: dict[str, int] = {}
+        self._image_tasks: set[asyncio.Task] = set()
         self._video_inflight: dict[str, int] = {}
         self._video_tasks: set[asyncio.Task] = set()
 
@@ -1151,7 +1152,9 @@ class GiteeAIImagePlugin(Star):
     async def terminate(self):
         self.debouncer.clear_all()
         try:
-            tasks = list(getattr(self, "_video_tasks", []))
+            tasks = list(getattr(self, "_image_tasks", [])) + list(
+                getattr(self, "_video_tasks", [])
+            )
             for t in tasks:
                 t.cancel()
             if tasks:
@@ -1809,6 +1812,7 @@ class GiteeAIImagePlugin(Star):
         output = (output or "").strip()
         size = output if output and "x" in output else None
         resolution = output if output and size is None else None
+        background_detached = False
 
         try:
             await mark_processing(event)
@@ -1831,15 +1835,26 @@ class GiteeAIImagePlugin(Star):
                     return self._llm_tool_text_result(
                         "The requested selfie image tool is disabled by plugin configuration."
                     )
-                image_path, task_meta = await self._generate_selfie_image_with_meta(
-                    event,
-                    prompt,
-                    target_backend,
-                    size=size,
-                    resolution=resolution,
-                )
-                return await self._finalize_llm_tool_image(
-                    event, image_path, task_meta=task_meta
+                try:
+                    task = asyncio.create_task(
+                        self._async_generate_selfie_llm_tool(
+                            event,
+                            prompt,
+                            user_id,
+                            backend=target_backend,
+                            size=size,
+                            resolution=resolution,
+                        )
+                    )
+                except Exception:
+                    await self._signal_llm_tool_failure(event)
+                    return self._llm_tool_text_result(
+                        "The selfie image request failed before background execution could start. This request has ended."
+                    )
+                self._track_image_task(task)
+                background_detached = True
+                return self._llm_tool_text_result(
+                    "Selfie generation has been accepted and is running in the background. The result will be sent to the user automatically when ready. Do not submit the same request again unless the user explicitly asks."
                 )
 
             # 自动模式：优先识别"自拍"语义 + 已配置参考照
@@ -1855,12 +1870,15 @@ class GiteeAIImagePlugin(Star):
                 else:
                     try:
                         logger.info("[aiimg_generate] route=auto->selfie_ref")
-                        image_path, task_meta = await self._generate_selfie_image_with_meta(
-                            event,
-                            prompt,
-                            target_backend,
-                            size=size,
-                            resolution=resolution,
+                        task = asyncio.create_task(
+                            self._async_generate_selfie_llm_tool(
+                                event,
+                                prompt,
+                                user_id,
+                                backend=target_backend,
+                                size=size,
+                                resolution=resolution,
+                            )
                         )
                     except Exception as e:
                         logger.warning(
@@ -1868,8 +1886,10 @@ class GiteeAIImagePlugin(Star):
                             e,
                         )
                     else:
-                        return await self._finalize_llm_tool_image(
-                            event, image_path, task_meta=task_meta
+                        self._track_image_task(task)
+                        background_detached = True
+                        return self._llm_tool_text_result(
+                            "Selfie generation has been accepted and is running in the background. The result will be sent to the user automatically when ready. Do not submit the same request again unless the user explicitly asks."
                         )
 
             if m == "auto":
@@ -1877,13 +1897,16 @@ class GiteeAIImagePlugin(Star):
                 if follow_up_selfie_meta is not None:
                     try:
                         logger.info("[aiimg_generate] route=auto->selfie_ref (follow-up)")
-                        image_path, task_meta = await self._generate_selfie_image_with_meta(
-                            event,
-                            prompt,
-                            target_backend,
-                            size=size,
-                            resolution=resolution,
-                            follow_up_meta=follow_up_selfie_meta,
+                        task = asyncio.create_task(
+                            self._async_generate_selfie_llm_tool(
+                                event,
+                                prompt,
+                                user_id,
+                                backend=target_backend,
+                                size=size,
+                                resolution=resolution,
+                                follow_up_meta=follow_up_selfie_meta,
+                            )
                         )
                     except Exception as e:
                         logger.warning(
@@ -1891,8 +1914,10 @@ class GiteeAIImagePlugin(Star):
                             e,
                         )
                     else:
-                        return await self._finalize_llm_tool_image(
-                            event, image_path, task_meta=task_meta
+                        self._track_image_task(task)
+                        background_detached = True
+                        return self._llm_tool_text_result(
+                            "Selfie generation has been accepted and is running in the background. The result will be sent to the user automatically when ready. Do not submit the same request again unless the user explicitly asks."
                         )
 
             # 改图：用户消息中有图片（不含头像兜底）或显式指定
@@ -1999,7 +2024,8 @@ class GiteeAIImagePlugin(Star):
                 + ". Do not retry automatically unless the user explicitly asks."
             )
         finally:
-            await self._end_user_job(user_id, kind="image")
+            if not background_detached:
+                await self._end_user_job(user_id, kind="image")
 
     @filter.llm_tool()
     async def grok_generate_video(self, event: AstrMessageEvent, prompt: str):
@@ -2164,6 +2190,64 @@ class GiteeAIImagePlugin(Star):
 
     async def _video_end(self, user_id: str) -> None:
         await self._end_user_job(str(user_id or ""), kind="video")
+
+    def _track_image_task(self, task: asyncio.Task) -> None:
+        self._image_tasks.add(task)
+        task.add_done_callback(lambda t: self._image_tasks.discard(t))
+
+    async def _async_generate_selfie_llm_tool(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        user_id: str,
+        *,
+        backend: str | None = None,
+        size: str | None = None,
+        resolution: str | None = None,
+        follow_up_meta: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            image_path, task_meta = await self._generate_selfie_image_with_meta(
+                event,
+                prompt,
+                backend,
+                size=size,
+                resolution=resolution,
+                follow_up_meta=follow_up_meta,
+            )
+            self._remember_last_image(event, image_path)
+            sent = await self._send_image_with_fallback(event, image_path)
+            if not sent:
+                await self._append_plugin_conversation_note(
+                    event,
+                    "The last selfie image task finished but the generated image could not be sent to the user. Do not retry automatically unless the user explicitly asks.",
+                )
+                await self._signal_llm_tool_failure(event)
+                logger.warning(
+                    "[自拍/LLM] 结果发送失败，已仅使用失败标记: reason=%s",
+                    sent.reason,
+                )
+                return
+            await mark_success(event)
+            await self._save_last_image_task_meta(event, task_meta)
+            await self._append_plugin_conversation_note(
+                event,
+                "The last selfie image task has completed and the image was already sent to the user. Do not continue or resubmit this task unless the user explicitly asks for another image.",
+            )
+        except Exception as e:
+            logger.error(f"[自拍/LLM] 失败: {e}", exc_info=True)
+            await self._append_plugin_conversation_note(
+                event,
+                "The last selfie image task failed and has ended. Reason: "
+                + self._summarize_status_text(
+                    e,
+                    fallback="unknown error",
+                )
+                + ". Do not retry automatically unless the user explicitly asks.",
+            )
+            await self._signal_llm_tool_failure(event)
+        finally:
+            await self._end_user_job(user_id, kind="image")
 
     async def _send_video_result(self, event: AstrMessageEvent, video_url: str) -> None:
         vconf = self._get_feature("video")
