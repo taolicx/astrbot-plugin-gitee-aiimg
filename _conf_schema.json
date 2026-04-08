@@ -344,9 +344,31 @@
     },
     "default": 2
   },
+  "max_global_image_concurrency": {
+    "description": "全局并发上限（图像）",
+    "hint": "整个插件同时进行的文生图/改图/自拍任务数量上限，用来降低高峰期内存压力。",
+    "type": "int",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    },
+    "default": 1
+  },
   "max_user_video_concurrency": {
     "description": "单用户并发上限（视频）",
     "hint": "同一用户同时进行的视频任务数量上限。",
+    "type": "int",
+    "slider": {
+      "min": 1,
+      "max": 5,
+      "step": 1
+    },
+    "default": 1
+  },
+  "max_global_video_concurrency": {
+    "description": "全局并发上限（视频）",
+    "hint": "整个插件同时进行的视频任务数量上限，用来降低高峰期内存和网络压力。",
     "type": "int",
     "slider": {
       "min": 1,
