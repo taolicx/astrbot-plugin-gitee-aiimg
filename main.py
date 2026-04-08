@@ -516,8 +516,10 @@ class GiteeAIImagePlugin(Star):
 
         self._concurrency_lock = asyncio.Lock()
         self._image_inflight: dict[str, int] = {}
+        self._global_image_inflight = 0
         self._image_tasks: set[asyncio.Task] = set()
         self._video_inflight: dict[str, int] = {}
+        self._global_video_inflight = 0
         self._video_tasks: set[asyncio.Task] = set()
 
         self._patch_tool_image_cache_runtime()
@@ -637,6 +639,20 @@ class GiteeAIImagePlugin(Star):
         v = self._as_int(self.config.get("max_user_video_concurrency", 1), default=1)
         return max(1, min(5, v))
 
+    def _get_max_global_image_concurrency(self) -> int:
+        v = self._as_int(
+            self.config.get("max_global_image_concurrency", 1),
+            default=1,
+        )
+        return max(1, min(10, v))
+
+    def _get_max_global_video_concurrency(self) -> int:
+        v = self._as_int(
+            self.config.get("max_global_video_concurrency", 1),
+            default=1,
+        )
+        return max(1, min(5, v))
+
     def _debounce_key(self, event: AstrMessageEvent, prefix: str, user_id: str) -> str:
         """尽量用消息维度去重，避免同用户短时间内无法并发提交多条任务。"""
         mid = str(
@@ -648,31 +664,63 @@ class GiteeAIImagePlugin(Star):
         return f"{prefix}:{user_id}"
 
     async def _begin_user_job(self, user_id: str, *, kind: str) -> bool:
-        user_id = str(user_id or "").strip()
-        if not user_id:
-            return True
-
         if kind == "video":
             limit = self._get_max_user_video_concurrency()
+            global_limit = self._get_max_global_video_concurrency()
             store = self._video_inflight
+            global_attr = "_global_video_inflight"
         else:
             limit = self._get_max_user_concurrency()
+            global_limit = self._get_max_global_image_concurrency()
             store = self._image_inflight
+            global_attr = "_global_image_inflight"
+
+        user_id = str(user_id or "").strip()
 
         async with self._concurrency_lock:
+            # 先拦全局占用，再拦单用户占用，避免小内存机器在高峰期被多用户同时压爆。
+            global_cur = int(getattr(self, global_attr, 0) or 0)
+            if global_cur >= global_limit:
+                logger.warning(
+                    "[GiteeAIImagePlugin] reject %s job because global limit is reached: current=%s limit=%s user=%s",
+                    kind,
+                    global_cur,
+                    global_limit,
+                    user_id or "<unknown>",
+                )
+                return False
+
+            if not user_id:
+                setattr(self, global_attr, global_cur + 1)
+                return True
+
             cur = int(store.get(user_id, 0) or 0)
             if cur >= limit:
+                logger.warning(
+                    "[GiteeAIImagePlugin] reject %s job because user limit is reached: user=%s current=%s limit=%s",
+                    kind,
+                    user_id,
+                    cur,
+                    limit,
+                )
                 return False
             store[user_id] = cur + 1
+            setattr(self, global_attr, global_cur + 1)
             return True
 
     async def _end_user_job(self, user_id: str, *, kind: str) -> None:
         user_id = str(user_id or "").strip()
-        if not user_id:
-            return
-
-        store = self._video_inflight if kind == "video" else self._image_inflight
+        if kind == "video":
+            store = self._video_inflight
+            global_attr = "_global_video_inflight"
+        else:
+            store = self._image_inflight
+            global_attr = "_global_image_inflight"
         async with self._concurrency_lock:
+            global_cur = int(getattr(self, global_attr, 0) or 0)
+            setattr(self, global_attr, max(0, global_cur - 1))
+            if not user_id:
+                return
             cur = int(store.get(user_id, 0) or 0)
             if cur <= 1:
                 store.pop(user_id, None)
@@ -1793,7 +1841,7 @@ class GiteeAIImagePlugin(Star):
         if not await self._begin_user_job(user_id, kind="image"):
             await mark_success(event)
             return self._llm_tool_text_result(
-                "An image request for this user is already in progress. Do not resubmit unless the user asks for a new request."
+                "An image request for this user is already in progress, or the server is already handling too many image tasks. Do not resubmit unless the user asks for a new request."
             )
 
         b_raw = (backend or "auto").strip()
@@ -2080,7 +2128,7 @@ class GiteeAIImagePlugin(Star):
         if not await self._video_begin(user_id):
             await mark_success(event)
             return self._llm_tool_text_result(
-                "A video request for this user is already in progress. Do not resubmit unless the user asks for a new request."
+                "A video request for this user is already in progress, or the server is already handling too many video tasks. Do not resubmit unless the user asks for a new request."
             )
 
         try:
